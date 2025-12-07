@@ -23,6 +23,7 @@ io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
     let browser = null;
     let page = null;
+    let client = null;
     let streamInterval = null;
 
     socket.on('start-session', async ({ url, width, height }) => {
@@ -47,6 +48,24 @@ io.on('connection', (socket) => {
             // Set a real User Agent to avoid basic bot detection
             await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
+            // Setup CDP for advanced features
+            const client = await page.target().createCDPSession();
+            await client.send('Page.enable');
+            
+            client.on('Page.frameStartedLoading', () => {
+                socket.emit('loading-start');
+            });
+
+            client.on('Page.loadEventFired', () => {
+                socket.emit('loading-end');
+            });
+            
+            client.on('Page.frameStoppedLoading', () => {
+                // Optional: also consider stopped loading as end, 
+                // but loadEventFired is more reliable for "done"
+                 socket.emit('loading-end');
+            });
+
             await page.setViewport({ width: width || 1280, height: height || 720 });
             
             // Console logging to debug
@@ -69,17 +88,28 @@ io.on('connection', (socket) => {
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
             
             // Start streaming screenshots
-            const startStreaming = () => {
-                if (streamInterval) clearInterval(streamInterval);
-                streamInterval = setInterval(async () => {
-                    if (!page) return;
+            const startStreaming = async () => {
+                // Recursive loop to prevent backpressure
+                const captureFrame = async () => {
+                    if (!page || !browser) return;
                     try {
-                        const screenshot = await page.screenshot({ encoding: 'base64', type: 'png' });
+                        const screenshot = await page.screenshot({ 
+                            encoding: 'base64', 
+                            type: 'jpeg', 
+                            quality: 70 
+                        });
                         socket.emit('frame', screenshot);
-                    } catch (err) {
                         
+                        // Schedule next frame only after current one is done
+                        // 20ms = ~50fps, smoother experience
+                        setTimeout(captureFrame, 20);
+                    } catch (err) {
+                        // If page is closed or other error, stop loop
+                        console.log('Frame capture stopped:', err.message);
                     }
-                }, 33); 
+                };
+
+                captureFrame();
             };
 
             startStreaming();
@@ -106,8 +136,9 @@ io.on('connection', (socket) => {
                     break;
                 case 'zoom':
                      // Using CDP to set page scale factor
-                    const client = await page.target().createCDPSession();
-                    await client.send('Emulation.setPageScaleFactor', { pageScaleFactor: event.scale });
+                    if (client) {
+                        await client.send('Emulation.setPageScaleFactor', { pageScaleFactor: event.scale });
+                    }
                     break;
                 case 'keydown':
                     await page.keyboard.press(event.key);
